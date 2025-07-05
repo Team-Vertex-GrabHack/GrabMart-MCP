@@ -1,27 +1,51 @@
 import asyncio
 import os
 import sys
+import logging
+import json
 from typing import Optional
 from contextlib import AsyncExitStack
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from google import genai
-from google.genai import types
+import boto3
+from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 
 load_dotenv()  # load environment variables from .env
+
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('mcp_client.log')
+    ]
+)
+
+logger = logging.getLogger(__name__)
+
 
 class MCPClient:
     def __init__(self):
         # Initialize session and client objects
         self.session: Optional[ClientSession] = None
         self.exit_stack = AsyncExitStack()
-        self.gemini_client = genai.Client(
-            api_key=os.environ.get("GEMINI_API_KEY"),
+        
+        # Initialize AWS Bedrock client
+        self.bedrock_client = boto3.client(
+            'bedrock-runtime',
+            region_name=os.environ.get('AWS_DEFAULT_REGION', 'us-east-1'),
+            aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID'),
+            aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY'),
+            aws_session_token=os.environ.get('AWS_SESSION_TOKEN')  # Optional for temporary credentials
         )
-        self.model = "gemini-2.5-flash-lite-preview-06-17"
+        
+        # Available models: anthropic.claude-3-5-sonnet-20241022-v2:0, anthropic.claude-3-haiku-20240307-v1:0, etc.
+        self.model_id = os.environ.get('BEDROCK_MODEL_ID', 'anthropic.claude-3-5-sonnet-20241022-v2:0')
 
     async def connect_to_server(self, server_script_path: str):
         """Connect to an MCP server
@@ -52,117 +76,128 @@ class MCPClient:
         tools = response.tools
         print("\nConnected to server with tools:", [tool.name for tool in tools])
 
-    def _format_tools_for_gemini(self, tools):
-        """Format MCP tools for Gemini's function calling format"""
+    def _format_tools_for_bedrock(self, tools):
+        """Format MCP tools for Bedrock's function calling format"""
         if not tools:
             return []
             
-        function_declarations = []
+        bedrock_tools = []
         for tool in tools:
-            # Create function declaration as a dict (not types.FunctionDeclaration)
-            function_declaration = {
+            # Format for Bedrock Claude models
+            bedrock_tool = {
                 "name": tool.name,
                 "description": tool.description,
-                "parameters": tool.inputSchema
+                "input_schema": tool.inputSchema
             }
-            function_declarations.append(function_declaration)
+            bedrock_tools.append(bedrock_tool)
         
-        # Create Tool object with function declarations
-        gemini_tool = types.Tool(function_declarations=function_declarations)
-        return [gemini_tool]
+        return bedrock_tools
+
+    def _create_bedrock_request(self, messages, tools=None):
+        """Create a request body for Bedrock Claude API"""
+        request_body = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 4000,
+            "messages": messages
+        }
+        
+        if tools:
+            request_body["tools"] = tools
+            
+        return request_body
 
     async def process_query(self, query: str) -> str:
-        """Process a query using Gemini and available tools"""
+        """Process a query using Bedrock Claude and available tools"""
         # Get available tools
         response = await self.session.list_tools()
-        available_tools = self._format_tools_for_gemini(response.tools)
+        available_tools = self._format_tools_for_bedrock(response.tools)
 
-        # Create initial conversation with tools
-        contents = [
-            types.Content(
-                role="user",
-                parts=[
-                    types.Part.from_text(text=query),
-                ],
-            ),
+        # Create initial conversation
+        messages = [
+            {
+                "role": "user",
+                "content": query
+            }
         ]
 
-        # Configure generation with function calling
-        generate_content_config = types.GenerateContentConfig(
-            thinking_config=types.ThinkingConfig(
-                thinking_budget=0,
-            ),
-            tools=available_tools,
-            response_mime_type="text/plain",
-        )
-
         try:
-            # Initial Gemini API call
-            response = self.gemini_client.models.generate_content(
-                model=self.model,
-                contents=contents,
-                config=generate_content_config,
+            # Initial Bedrock API call
+            request_body = self._create_bedrock_request(messages, available_tools)
+            
+            response = self.bedrock_client.invoke_model(
+                modelId=self.model_id,
+                body=json.dumps(request_body)
             )
 
-            final_text = []
-
+            response_body = json.loads(response['body'].read())
+            
             # Process the response
-            if response.candidates and len(response.candidates) > 0:
-                candidate = response.candidates[0]
+            if 'content' in response_body:
+                content = response_body['content']
+                final_text = []
                 
-                # Handle text content
-                if candidate.content and candidate.content.parts:
-                    for part in candidate.content.parts:
-                        if hasattr(part, 'text') and part.text:
-                            final_text.append(part.text)
-                        elif hasattr(part, 'function_call') and part.function_call:
-                            # Handle function call
-                            function_call = part.function_call
-                            tool_name = function_call.name
-                            tool_args = dict(function_call.args) if function_call.args else {}
+                for content_block in content:
+                    if content_block['type'] == 'text':
+                        final_text.append(content_block['text'])
+                    elif content_block['type'] == 'tool_use':
+                        # Handle tool use
+                        tool_use = content_block
+                        tool_name = tool_use['name']
+                        tool_args = tool_use['input']
+                        tool_use_id = tool_use['id']
+                        
+                        logger.info(f"[Calling tool {tool_name} with args {tool_args}]")
+                        
+                        # Execute tool call
+                        try:
+                            result = await self.session.call_tool(tool_name, tool_args)
                             
-                            final_text.append(f"[Calling tool {tool_name} with args {tool_args}]")
+                            # print(f"Tool result: {result}")
                             
-                            # Execute tool call
-                            try:
-                                result = await self.session.call_tool(tool_name, tool_args)
-                                
-                                # Add function response to conversation
-                                contents.append(candidate.content)  # Add the assistant's response with function call
-                                contents.append(
-                                    types.Content(
-                                        role="user",
-                                        parts=[
-                                            types.Part.from_function_response(
-                                                name=tool_name,
-                                                response={"result": str(result.content)}
-                                            )
-                                        ],
-                                    )
-                                )
-                                # Get follow-up response from Gemini
-                                follow_up_response = self.gemini_client.models.generate_content(
-                                    model=self.model,
-                                    contents=contents,
-                                    config=generate_content_config,
-                                )
-                                
-                                if (follow_up_response.candidates and 
-                                    len(follow_up_response.candidates) > 0 and
-                                    follow_up_response.candidates[0].content and
-                                    follow_up_response.candidates[0].content.parts):
-                                    
-                                    for part in follow_up_response.candidates[0].content.parts:
-                                        if hasattr(part, 'text') and part.text:
-                                            final_text.append(part.text)
+                            # Add assistant message with tool use
+                            messages.append({
+                                "role": "assistant",
+                                "content": response_body['content']
+                            })
+                            
+                            # Add tool result
+                            messages.append({
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "tool_result",
+                                        "tool_use_id": tool_use_id,
+                                        "content": str(result.content)
+                                    }
+                                ]
+                            })
+                            
+                            # Get follow-up response from Bedrock
+                            follow_up_request = self._create_bedrock_request(messages, available_tools)
+                            
+                            follow_up_response = self.bedrock_client.invoke_model(
+                                modelId=self.model_id,
+                                body=json.dumps(follow_up_request)
+                            )
+                            
+                            follow_up_body = json.loads(follow_up_response['body'].read())
+                            
+                            if 'content' in follow_up_body:
+                                for follow_up_content in follow_up_body['content']:
+                                    if follow_up_content['type'] == 'text':
+                                        final_text.append(follow_up_content['text'])
                                             
-                            except Exception as e:
-                                final_text.append(f"Error executing tool {tool_name}: {str(e)}")
+                        except Exception as e:
+                            final_text.append(f"Error executing tool {tool_name}: {str(e)}")
                 
                 return "\n".join(final_text) if final_text else "No response generated"
             else:
-                return "No response generated from Gemini"
+                return "No response generated from Bedrock"
                 
+        except ClientError as e:
+            error_code = e.response['Error']['Code']
+            error_message = e.response['Error']['Message']
+            return f"Bedrock API error ({error_code}): {error_message}"
         except Exception as e:
             return f"Error processing query: {str(e)}"
 
